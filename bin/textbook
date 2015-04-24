@@ -1,0 +1,156 @@
+#!/usr/bin/env ruby
+
+file_path = File.dirname(File.absolute_path(__FILE__))
+Dir.glob(file_path + '/../lib/**/*.rb') {|file| require file}
+
+$stdout.sync = true
+$stderr.sync = true
+
+require 'logger'
+require 'clamp'
+require 'open-uri'
+require 'nokogiri'
+require 'iconv'
+require 'fileutils'
+require 'httparty'
+require 'yaml'
+
+Clamp do
+  option ['-u', '--url'], "URL", 'Url to download', :required => true
+  option ['-t', '--type'], 'TYPE', 'download type', :required => true
+  option ['-o', '--output'], 'OUTPUT', "output directory", :default => "../data"
+  option ['-v', '--verbose'], :flag, 'debug info'
+
+  def execute
+    output="../data"
+    #http://www.aoshu.com/zlk/dzkb/sx/sjb/
+    case type
+      when "grade"
+          book_list = get_book_list
+          book_list.each do |book_url, downloaded|
+            download_book(book_url, output) unless downloaded == 'true'
+            book_list[book_url] = "true"
+          end
+      when "year"
+        download_book(url, output)
+      else
+        logger.info "don't know what to download"
+    end
+
+  end
+
+  private
+
+  def config_file
+    @config_file ||= "#{output}/config/#{type}.config"
+  end
+
+  def get_book_list
+    unless File.exists?(config_file)
+      logger.info
+      File.open("#{output}/config/#{type}.config", "w+") do |file|
+        all_links = {}.tap do |result|
+          get_all_years(url).each do |link|
+            result[link] = "false"
+          end
+        end
+        file.write(all_links.to_yaml)
+      end
+    end
+    all_links = YAML.load(File.read(config_file))
+    all_links
+  end
+
+  def update_book_list(book_list)
+    File.open("#{output}/config/#{type}.config", "w+") do |file|
+      file.write(book_list.to_yaml)
+    end
+
+  end
+
+  def get_all_years(url)
+    response = open_with_retry{get_page(url)}
+    response.css('div.book-rjb a').select{|link| !/shtml$/.match(link['href'])}.map{|link| link['href']}.uniq
+  end
+
+  def download_book(url, output)
+    response = open_with_retry{get_page(url)}
+    #get title for directory
+    book_title = response.css('head title').text
+    logger.info "download book #{book_title} from url #{url}"
+    output_dir = "#{output}/#{book_title}"
+    FileUtils.mkdir_p("#{output_dir}") unless Dir.exists?("#{output_dir}")
+
+    parse_textbook(response, output_dir)
+
+    get_additional_links(response).each do |link|
+      logger.info "parse #{link}"
+      additional = open_with_retry{get_page(link)}
+      parse_textbook(additional, output_dir)
+    end
+  end
+
+  def get_page(url)
+    logger.info url
+    response = open(url).read
+    response = Iconv.conv("utf-8", "gb2312", response)
+    Nokogiri::HTML.parse(response)
+  end
+
+  def get_additional_links(response)
+    response.css('div.btn-pages a').select{|link| link['href']}.map{|link|link['href']}.uniq
+  end
+
+  def get_pagelinks(response)
+    if !response.css('div.tk-con').nil?
+      response.css('div.tk-con').css('ul')[0].css('li a')
+    elsif !response.css('div.title').nil?
+      response.css('div.title a')
+    end
+  end
+
+  def parse_textbook(response, output_dir)
+    page_links = get_pagelinks(response)
+
+    page_links.each do |link|
+      logger.info "#{link.text}\t#{link['href']}"
+      section = open(link['href']).read
+      section = Iconv.conv("utf-8", "gb2312", section)
+      section = Nokogiri::HTML.parse(section)
+      img_links = section.css('div.content p').css('img')
+      img_links.each do |img|
+        begin
+        img_id = /.*=(\d+)$/.match(img['src'])[1]
+        img_file = "#{output_dir}/#{img_id}.jpg"
+        #download(img['src'], "#{output_dir}/#{img_id}.jpg")
+        open_with_retry{download(img['src'], "#{output_dir}/#{img_id}.jpg")}
+        rescue => e
+          logger.warn "img: #{img}, #{e}"
+        end
+      end
+    end
+  end
+
+  def open_with_retry(&block)
+    success = false
+    begin
+      resp = block.call
+      success = true
+    rescue Net::ReadTimeout => e
+      logger.warn("retry after error #{e.message}")
+      sleep 5
+    end until success
+    resp
+  end
+
+  def download(url, file_name)
+    logger.info "download #{url} to #{file_name}"
+    File.open(file_name, "wb") do |f|
+      f.write HTTParty.get(url).body
+    end
+  end
+
+  def logger
+     @logger ||= Logger.new STDOUT
+  end
+end
